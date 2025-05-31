@@ -1,738 +1,272 @@
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
+const QRCode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
 
-// ===============================
-// KONFIGURASI BOT
-// ===============================
+// Konfigurasi logging
+const LOG_FILE = path.join(__dirname, 'bot.log');
 
-// Token bot Telegram (ganti dengan token bot Anda)
-const BOT_TOKEN = '7585136076:AAHCMVn8iYGHDTNRdcnk9tznO-Y_O46BfYo';
+function log(level, message, data = {}) {
+    const timestamp = new Date().toISOString();
+    const logMessage = `[${timestamp}] [${level}] ${message} ${Object.keys(data).length ? JSON.stringify(data, null, 2) : ''}`;
+    const colors = {
+        DEBUG: '\x1b[36m',
+        INFO: '\x1b[32m', 
+        WARN: '\x1b[33m',
+        ERROR: '\x1b[31m'
+    };
+    console.log(`${colors[level]}${logMessage}\x1b[0m`);
+    fs.appendFileSync(LOG_FILE, logMessage + '\n');
+}
 
-// Konfigurasi admin
-const ADMIN_CONFIG = {
-    adminIds: [5649339918, 5649339918], // Ganti dengan Telegram ID admin yang valid
-    superAdminId: 5649339918, // Super admin yang bisa menambah admin lain
-};
-
-// Konfigurasi DOR
+// Konfigurasi API
 const DOR_CONFIG = {
-    packageCode: 'XL_EDU_2GB_1K_DANA', // Default package
-    autoPayment: true, // Otomatis gunakan balance
-    minBalance: 5000 // Minimum balance required (dalam rupiah)
+    apiUrl: 'https://golang-openapi-packagepurchase-xltembakservice.kmsp-store.com/v1',
+    apiKey: 'fe53906b-a4a4-4ce0-bdbd-a80dfaa003db',
+    packageCode: 'XLUNLITURBOPREMIUMPROMO3K', // Default package
+    paymentMethod: 'BALANCE' // Default payment method: 'DANA', 'QRIS', atau 'BALANCE'
 };
 
-// Konfigurasi API XL
-const XL_API_CONFIG = {
-    baseUrl: 'https://golang-openapi-xltembakservice.kmsp-store.com',
+const OTP_CONFIG = {
+    requestUrl: 'https://golang-openapi-reqotp-xltembakservice.kmsp-store.com/v1',
+    verifyUrl: 'https://golang-openapi-login-xltembakservice.kmsp-store.com/v1',
     apiKey: 'fe53906b-a4a4-4ce0-bdbd-a80dfaa003db'
 };
 
-// Konfigurasi API Package List
-const PACKAGE_API_CONFIG = {
-    baseUrl: 'https://golang-openapi-packagelist-xltembakservice.kmsp-store.com/v1',
-    apiKey: 'fe53906b-a4a4-4ce0-bdbd-a80dfaa003db',
-    timeout: 15000
-};
-
-// Konfigurasi balance
+// Tambahkan konfigurasi API untuk balance check
 const BALANCE_CONFIG = {
-    defaultBalance: 0,
-    topupMethods: ['DANA', 'QRIS', 'MANUAL'] // Method untuk top up balance
+    apiUrl: 'https://golang-openapi-panelaccountbalance-xltembakservice.kmsp-store.com/v1',
+    apiKey: 'fe53906b-a4a4-4ce0-bdbd-a80dfaa003db'
 };
 
-// Cache untuk package list (refresh setiap 30 menit)
-let packageListCache = {
-    data: null,
-    lastFetch: null,
-    ttl: 30 * 60 * 1000 // 30 menit
+// Tambahkan konfigurasi API untuk quota details
+const QUOTA_CONFIG = {
+    apiUrl: 'https://golang-openapi-quotadetails-xltembakservice.kmsp-store.com/v1',
+    apiKey: 'fe53906b-a4a4-4ce0-bdbd-a80dfaa003db'
 };
 
-// ===============================
-// INISIALISASI BOT
-// ===============================
+// Ganti dengan token bot Telegram Anda dari @BotFather
+const TELEGRAM_TOKEN = '7585136076:AAHCMVn8iYGHDTNRdcnk9tznO-Y_O46BfYo';
 
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+// Inisialisasi bot Telegram
+const bot = new TelegramBot(TELEGRAM_TOKEN, {polling: true});
 
-console.log('🤖 XL DOR Bot started successfully!');
+// File untuk menyimpan data OTP
+const OTP_DATA_FILE = path.join(__dirname, 'otp_data.json');
 
-// ===============================
-// FUNGSI HELPER
-// ===============================
-
-// Fungsi logging
-function log(level, message, data = {}) {
-    const timestamp = new Date().toISOString();
-    const logEntry = {
-        timestamp,
-        level,
-        message,
-        data
-    };
-    
-    console.log(`[${timestamp}] ${level}: ${message}`, data);
-    
-    // Simpan ke file log
-    try {
-        let logs = [];
-        try {
-            const logData = fs.readFileSync('bot_logs.json', 'utf8');
-            logs = JSON.parse(logData);
-        } catch (error) {
-            // File belum ada
-        }
-        
-        logs.unshift(logEntry);
-        
-        // Batasi log hanya 1000 entry terakhir
-        if (logs.length > 1000) {
-            logs = logs.slice(0, 1000);
-        }
-        
-        fs.writeFileSync('bot_logs.json', JSON.stringify(logs, null, 2));
-    } catch (error) {
-        console.error('Failed to save log:', error.message);
-    }
-}
-
-// Fungsi untuk load/save data OTP
+// Fungsi untuk mengelola data OTP
 function loadOtpData() {
     try {
-        const data = fs.readFileSync('otp_data.json', 'utf8');
-        return JSON.parse(data);
+        if (fs.existsSync(OTP_DATA_FILE)) {
+            const data = fs.readFileSync(OTP_DATA_FILE, 'utf8');
+            return JSON.parse(data);
+        }
+        return {};
     } catch (error) {
+        log('ERROR', 'Failed to load OTP data', { error: error.message });
         return {};
     }
 }
 
 function saveOtpData(data) {
     try {
-        fs.writeFileSync('otp_data.json', JSON.stringify(data, null, 2));
+        fs.writeFileSync(OTP_DATA_FILE, JSON.stringify(data, null, 2));
+        log('DEBUG', 'OTP data saved successfully');
     } catch (error) {
         log('ERROR', 'Failed to save OTP data', { error: error.message });
+        throw error;
+    }
+}
+
+function updateUserOtpData(chatId, data) {
+    try {
+        const otpData = loadOtpData();
+        otpData[chatId] = {
+            ...data,
+            timestamp: Date.now(),
+            updated_at: new Date().toISOString()
+        };
+        saveOtpData(otpData);
+        log('INFO', 'User OTP data updated', { chatId, status: data.status });
+    } catch (error) {
+        log('ERROR', 'Failed to update user OTP data', { chatId, error: error.message });
+        throw error;
     }
 }
 
 function getUserOtpData(chatId) {
-    const otpData = loadOtpData();
-    return otpData[chatId] || null;
-}
-
-// Fungsi admin
-function isAdmin(chatId) {
-    return ADMIN_CONFIG.adminIds.includes(parseInt(chatId));
-}
-
-function isSuperAdmin(chatId) {
-    return ADMIN_CONFIG.superAdminId === parseInt(chatId);
-}
-
-// ===============================
-// FUNGSI BALANCE MANAGEMENT
-// ===============================
-
-function getUserBalance(chatId) {
-    const otpData = loadOtpData();
-    return otpData[chatId]?.balance || 0;
-}
-
-function updateUserBalance(chatId, amount, type = 'add') {
-    const otpData = loadOtpData();
-    if (!otpData[chatId]) {
-        otpData[chatId] = { balance: 0 };
-    }
-    
-    if (type === 'add') {
-        otpData[chatId].balance = (otpData[chatId].balance || 0) + amount;
-    } else if (type === 'subtract') {
-        otpData[chatId].balance = Math.max(0, (otpData[chatId].balance || 0) - amount);
-    } else if (type === 'set') {
-        otpData[chatId].balance = amount;
-    }
-    
-    saveOtpData(otpData);
-    return otpData[chatId].balance;
-}
-
-function getPackagePrice(packageCode) {
-    // Mapping harga paket (dalam rupiah) - akan diupdate dari API
-    const packagePrices = {
-        'XL_EDU_2GB_1K_DANA': 2000,
-        'XL_EDU_5GB_2K_DANA': 3000,
-        'XL_COMBO_3GB_15K': 15000,
-        'XLUNLITURBOSUPERXCPROMO15K_PL': 3000,
-        'XL_COMBO_FLEX_S_30D': 21500,
-        'XL_UNLIMITED_DAILY': 5000,
-        'XL_UNLIMITED_DAILY_PLUS': 8000,
-        'XL_PRIORITY_UNLIMITED': 50000,
-        'XL_GAMING_PRO_30D': 35000,
-    };
-    return packagePrices[packageCode] || 5000; // Default 5000 jika tidak ditemukan
-}
-
-// ===============================
-// FUNGSI PACKAGE LIST API
-// ===============================
-
-async function fetchPackageList(forceRefresh = false) {
     try {
-        // Cek cache terlebih dahulu
-        if (!forceRefresh && packageListCache.data && 
-            packageListCache.lastFetch && 
-            (Date.now() - packageListCache.lastFetch) < packageListCache.ttl) {
-            log('INFO', 'Using cached package list');
-            return packageListCache.data;
-        }
+        const otpData = loadOtpData();
+        return otpData[chatId];
+    } catch (error) {
+        log('ERROR', 'Failed to get user OTP data', { chatId, error: error.message });
+        return null;
+    }
+}
 
-        log('INFO', 'Fetching package list from API');
+function deleteUserOtpData(chatId) {
+    try {
+        const otpData = loadOtpData();
+        if (otpData[chatId]) {
+            delete otpData[chatId];
+            saveOtpData(otpData);
+            log('INFO', 'User OTP data deleted', { chatId });
+        }
+    } catch (error) {
+        log('ERROR', 'Failed to delete user OTP data', { chatId, error: error.message });
+        throw error;
+    }
+}
+
+// Fungsi untuk mengambil saldo akun panel
+async function getAccountBalance() {
+    try {
+        log('DEBUG', 'Fetching account balance from API');
         
-        const response = await axios.get(`${PACKAGE_API_CONFIG.baseUrl}?api_key=${PACKAGE_API_CONFIG.apiKey}`, {
+        const balanceUrl = `${BALANCE_CONFIG.apiUrl}?api_key=${BALANCE_CONFIG.apiKey}`;
+        
+        const response = await axios.get(balanceUrl, {
             headers: {
-                'Content-Type': 'application/json',
-                'User-Agent': 'XL-DOR-Bot/1.0'
-            },
-            timeout: PACKAGE_API_CONFIG.timeout
+                'Content-Type': 'application/json'
+            }
         });
 
-        if (response.data.status === true && response.data.statusCode === 200) {
-            // Update cache
-            packageListCache.data = response.data.data;
-            packageListCache.lastFetch = Date.now();
-            
-            log('INFO', 'Package list fetched successfully', {
-                totalPackages: response.data.data.length
-            });
-            
-            return response.data.data;
-        } else {
-            throw new Error(response.data.message || 'Failed to fetch package list');
-        }
+        log('INFO', 'Account balance fetched successfully', {
+            status: response.data.status,
+            statusCode: response.data.statusCode,
+            balance: response.data.data?.balance
+        });
 
+        return response.data;
     } catch (error) {
-        log('ERROR', 'Failed to fetch package list', {
+        log('ERROR', 'Failed to fetch account balance', {
             error: error.message,
             response: error.response?.data
         });
-        
-        // Return cached data jika ada error tapi cache masih ada
-        if (packageListCache.data) {
-            log('WARN', 'Using cached data due to API error');
-            return packageListCache.data;
-        }
-        
         throw error;
     }
 }
 
-function formatPackagePrice(packageHargaInt) {
-    if (typeof packageHargaInt === 'number') {
-        return `Rp ${packageHargaInt.toLocaleString('id-ID')}`;
-    }
-    return 'Harga tidak tersedia';
-}
-
-function truncateText(text, maxLength = 80) {
-    if (!text) return 'Tidak ada deskripsi';
-    if (text.length <= maxLength) return text;
-    return text.substring(0, maxLength) + '...';
-}
-
-// ===============================
-// FUNGSI XL API
-// ===============================
-
-async function requestOtp(nomorHp) {
+// Fungsi untuk mengambil detail kuota aktif
+async function getQuotaDetails(accessToken) {
     try {
-        const response = await axios.post(`${XL_API_CONFIG.baseUrl}/v1/otp/request`, {
-            msisdn: nomorHp
-        }, {
+        log('DEBUG', 'Fetching quota details from API');
+        
+        const quotaUrl = `${QUOTA_CONFIG.apiUrl}?api_key=${QUOTA_CONFIG.apiKey}&access_token=${accessToken}`;
+        
+        const response = await axios.get(quotaUrl, {
             headers: {
-                'Content-Type': 'application/json',
-                'api-key': XL_API_CONFIG.apiKey
-            },
-            timeout: 10000
-        });
-
-        return response.data;
-    } catch (error) {
-        log('ERROR', 'OTP request failed', {
-            error: error.message,
-            response: error.response?.data,
-            nomorHp
-        });
-        throw error;
-    }
-}
-
-async function verifyOtp(authId, otpCode) {
-    try {
-        const response = await axios.post(`${XL_API_CONFIG.baseUrl}/v1/otp/verify`, {
-            auth_id: authId,
-            otp_code: otpCode
-        }, {
-            headers: {
-                'Content-Type': 'application/json',
-                'api-key': XL_API_CONFIG.apiKey
-            },
-            timeout: 10000
-        });
-
-        return response.data;
-    } catch (error) {
-        log('ERROR', 'OTP verification failed', {
-            error: error.message,
-            response: error.response?.data,
-            authId
-        });
-        throw error;
-    }
-}
-
-async function processDorRequest(nomorHp, accessToken, packageCode, paymentMethod = 'BALANCE') {
-    try {
-        const response = await axios.post(`${XL_API_CONFIG.baseUrl}/v1/dor`, {
-            msisdn: nomorHp,
-            package_code: packageCode,
-            payment_method: paymentMethod
-        }, {
-            headers: {
-                'Content-Type': 'application/json',
-                'api-key': XL_API_CONFIG.apiKey,
-                'Authorization': `Bearer ${accessToken}`
-            },
-            timeout: 30000
-        });
-
-        return response.data;
-    } catch (error) {
-        log('ERROR', 'DOR request failed', {
-            error: error.message,
-            response: error.response?.data,
-            nomorHp,
-            packageCode
-        });
-        throw error;
-    }
-}
-
-// ===============================
-// FUNGSI ADMIN
-// ===============================
-
-function saveAdminAction(adminId, action) {
-    try {
-        let adminLogs = [];
-        try {
-            const logsData = fs.readFileSync('admin_logs.json', 'utf8');
-            adminLogs = JSON.parse(logsData);
-        } catch (error) {
-            // File belum ada
-        }
-
-        adminLogs.unshift({
-            admin_id: adminId,
-            ...action
-        });
-
-        // Batasi log hanya 1000 entry terakhir
-        if (adminLogs.length > 1000) {
-            adminLogs = adminLogs.slice(0, 1000);
-        }
-
-        fs.writeFileSync('admin_logs.json', JSON.stringify(adminLogs, null, 2));
-    } catch (error) {
-        log('ERROR', 'Failed to save admin action', { error: error.message });
-    }
-}
-
-function getUserTransactionHistory(userId) {
-    try {
-        const historyData = fs.readFileSync('transaction_history.json', 'utf8');
-        const history = JSON.parse(historyData);
-        return history[userId] || [];
-    } catch (error) {
-        return [];
-    }
-}
-
-function saveTransactionHistory(chatId, transaction) {
-    try {
-        let history = {};
-        try {
-            const historyData = fs.readFileSync('transaction_history.json', 'utf8');
-            history = JSON.parse(historyData);
-        } catch (error) {
-            // File belum ada, buat object kosong
-        }
-        
-        if (!history[chatId]) {
-            history[chatId] = [];
-        }
-        
-        history[chatId].unshift(transaction); // Tambah ke awal array
-        
-        // Batasi riwayat hanya 50 transaksi terakhir per user
-        if (history[chatId].length > 50) {
-            history[chatId] = history[chatId].slice(0, 50);
-        }
-        
-        fs.writeFileSync('transaction_history.json', JSON.stringify(history, null, 2));
-    } catch (error) {
-        log('ERROR', 'Failed to save transaction history', { error: error.message });
-    }
-}
-
-// ===============================
-// FUNGSI PACKAGE LIST DISPLAY
-// ===============================
-
-async function showPackageListPage(chatId, messageId, packages, page) {
-    const itemsPerPage = 8;
-    const totalPages = Math.ceil(packages.length / itemsPerPage);
-    const startIndex = (page - 1) * itemsPerPage;
-    const endIndex = startIndex + itemsPerPage;
-    const currentPackages = packages.slice(startIndex, endIndex);
-    
-    let packageText = `📦 *DAFTAR PAKET XL* (Total: ${packages.length} paket)\n`;
-    packageText += `📄 Halaman ${page} dari ${totalPages}\n\n`;
-    
-    currentPackages.forEach((pkg, index) => {
-        const number = startIndex + index + 1;
-        packageText += `*${number}. ${pkg.package_name}*\n`;
-        packageText += `🔖 Code: \`${pkg.package_code}\`\n`;
-        packageText += `💰 Harga: ${formatPackagePrice(pkg.package_harga_int)}\n`;
-        packageText += `📝 ${truncateText(pkg.package_description, 60)}\n`;
-        
-        // Info tambahan jika ada
-        const infoItems = [];
-        if (pkg.have_daily_limit && pkg.daily_limit_details?.max_daily_transaction_limit) {
-            infoItems.push(`📊 Limit: ${pkg.daily_limit_details.max_daily_transaction_limit}/hari`);
-        }
-        if (pkg.have_cut_off_time && pkg.cut_off_time) {
-            infoItems.push(`🕐 Cut-off: ${pkg.cut_off_time.prohibited_hour_starttime}-${pkg.cut_off_time.prohibited_hour_endtime}`);
-        }
-        if (infoItems.length > 0) {
-            packageText += `${infoItems.join(' • ')}\n`;
-        }
-        
-        packageText += `\n`;
-    });
-    
-    // Buat inline keyboard untuk navigasi dan aksi
-    const keyboard = {
-        inline_keyboard: []
-    };
-    
-    // Row untuk pagination
-    const paginationRow = [];
-    if (page > 1) {
-        paginationRow.push({ text: "⬅️ Prev", callback_data: `pkg_page_${page - 1}` });
-    }
-    paginationRow.push({ text: `${page}/${totalPages}`, callback_data: `pkg_info` });
-    if (page < totalPages) {
-        paginationRow.push({ text: "Next ➡️", callback_data: `pkg_page_${page + 1}` });
-    }
-    keyboard.inline_keyboard.push(paginationRow);
-    
-    // Row untuk aksi
-    keyboard.inline_keyboard.push([
-        { text: "🔍 Cari Paket", callback_data: "search_package" },
-        { text: "🔄 Refresh", callback_data: "refresh_packages" }
-    ]);
-    
-    keyboard.inline_keyboard.push([
-        { text: "📋 Kategori", callback_data: "filter_packages" },
-        { text: "❌ Tutup", callback_data: "close_packages" }
-    ]);
-
-    try {
-        await bot.editMessageText(packageText, {
-            chat_id: chatId,
-            message_id: messageId,
-            parse_mode: 'Markdown',
-            reply_markup: keyboard
-        });
-    } catch (error) {
-        log('ERROR', 'Failed to edit package list message', { error: error.message });
-    }
-}
-
-async function showSearchResults(chatId, messageId, filteredPackages, keyword, page) {
-    const itemsPerPage = 6;
-    const totalPages = Math.ceil(filteredPackages.length / itemsPerPage);
-    const startIndex = (page - 1) * itemsPerPage;
-    const endIndex = startIndex + itemsPerPage;
-    const currentPackages = filteredPackages.slice(startIndex, endIndex);
-    
-    let searchText = `🔍 *HASIL PENCARIAN* (${filteredPackages.length} paket)\n`;
-    searchText += `📝 Keyword: "*${keyword}*"\n`;
-    searchText += `📄 Halaman ${page} dari ${totalPages}\n\n`;
-    
-    currentPackages.forEach((pkg, index) => {
-        const number = startIndex + index + 1;
-        searchText += `*${number}. ${pkg.package_name}*\n`;
-        searchText += `🔖 \`${pkg.package_code}\`\n`;
-        searchText += `💰 ${formatPackagePrice(pkg.package_harga_int)}\n`;
-        searchText += `📝 ${truncateText(pkg.package_description, 50)}\n\n`;
-    });
-    
-    const keyboard = {
-        inline_keyboard: []
-    };
-    
-    // Pagination untuk hasil pencarian
-    const paginationRow = [];
-    if (page > 1) {
-        paginationRow.push({ text: "⬅️ Prev", callback_data: `search_page_${keyword}_${page - 1}` });
-    }
-    if (filteredPackages.length > itemsPerPage) {
-        paginationRow.push({ text: `${page}/${totalPages}`, callback_data: `search_info` });
-    }
-    if (page < totalPages) {
-        paginationRow.push({ text: "Next ➡️", callback_data: `search_page_${keyword}_${page + 1}` });
-    }
-    if (paginationRow.length > 0) {
-        keyboard.inline_keyboard.push(paginationRow);
-    }
-    
-    keyboard.inline_keyboard.push([
-        { text: "🔍 Cari Lagi", callback_data: "search_package" },
-        { text: "📋 Semua Paket", callback_data: "refresh_packages" }
-    ]);
-    
-    keyboard.inline_keyboard.push([
-        { text: "❌ Tutup", callback_data: "close_packages" }
-    ]);
-
-    try {
-        await bot.editMessageText(searchText, {
-            chat_id: chatId,
-            message_id: messageId,
-            parse_mode: 'Markdown',
-            reply_markup: keyboard
-        });
-    } catch (error) {
-        log('ERROR', 'Failed to edit search results', { error: error.message });
-    }
-}
-
-async function showPackageDetail(chatId, messageId, pkg) {
-    let detailText = `📦 *DETAIL PAKET*\n\n`;
-    detailText += `*${pkg.package_name}*\n`;
-    detailText += `🔖 Code: \`${pkg.package_code}\`\n`;
-    detailText += `💰 Harga: ${formatPackagePrice(pkg.package_harga_int)}\n\n`;
-    
-    // Deskripsi paket
-    detailText += `📝 *Deskripsi:*\n${pkg.package_description || 'Tidak ada deskripsi'}\n\n`;
-    
-    // Fitur dan pembatasan paket
-    detailText += `*📋 Informasi Paket:*\n`;
-    detailText += `• Multi transaksi: ${pkg.can_multi_trx ? '✅ Ya' : '❌ Tidak'}\n`;
-    detailText += `• Transaksi terjadwal: ${pkg.can_scheduled_trx ? '✅ Ya' : '❌ Tidak'}\n`;
-    detailText += `• Perlu login: ${!pkg.no_need_login ? '✅ Ya' : '❌ Tidak'}\n`;
-    detailText += `• Cek stok: ${pkg.need_check_stock ? '✅ Ya' : '❌ Tidak'}\n\n`;
-    
-    // Limit harian jika ada
-    if (pkg.have_daily_limit && pkg.daily_limit_details) {
-        detailText += `*⚠️ Batasan Harian:*\n`;
-        detailText += `• Maksimal: ${pkg.daily_limit_details.max_daily_transaction_limit} transaksi/hari\n`;
-        detailText += `• Saat ini: ${pkg.daily_limit_details.current_daily_transaction_count} transaksi\n`;
-        detailText += `• Tersisa: ${pkg.daily_limit_details.max_daily_transaction_limit - pkg.daily_limit_details.current_daily_transaction_count} transaksi\n\n`;
-    }
-    
-    // Cut-off time jika ada
-    if (pkg.have_cut_off_time && pkg.cut_off_time) {
-        detailText += `*🕐 Jam Operasional:*\n`;
-        detailText += `• Tidak tersedia: ${pkg.cut_off_time.prohibited_hour_starttime} - ${pkg.cut_off_time.prohibited_hour_endtime}\n\n`;
-    }
-    
-    // Metode pembayaran yang tersedia
-    if (pkg.is_show_payment_method && pkg.available_payment_methods?.length > 0) {
-        detailText += `*💳 Metode Pembayaran:*\n`;
-        pkg.available_payment_methods.forEach((method, index) => {
-            detailText += `${index + 1}. ${method.payment_method_display_name}\n`;
-            if (method.desc) {
-                detailText += `   📝 ${method.desc}\n`;
+                'Content-Type': 'application/json'
             }
         });
-        detailText += `\n`;
-    }
 
-    const keyboard = {
-        inline_keyboard: [
-            [
-                { text: "🛒 Pilih Paket Ini", callback_data: `set_package_${pkg.package_code}` },
-                { text: "🔄 Refresh Detail", callback_data: `refresh_detail_${pkg.package_code}` }
-            ],
-            [
-                { text: "📋 Kembali ke Daftar", callback_data: "refresh_packages" },
-                { text: "❌ Tutup", callback_data: "close_packages" }
-            ]
-        ]
-    };
-
-    try {
-        await bot.editMessageText(detailText, {
-            chat_id: chatId,
-            message_id: messageId,
-            parse_mode: 'Markdown',
-            reply_markup: keyboard
+        log('INFO', 'Quota details fetched successfully', {
+            status: response.data.status,
+            statusCode: response.data.statusCode,
+            msisdn: response.data.data?.msisdn,
+            totalQuotas: response.data.data?.quotas?.length || 0
         });
+
+        return response.data;
     } catch (error) {
-        log('ERROR', 'Failed to show package detail', { error: error.message });
+        log('ERROR', 'Failed to fetch quota details', {
+            error: error.message,
+            response: error.response?.data
+        });
+        throw error;
     }
 }
 
-// ===============================
-// DOR TRANSACTION PROCESSING
-// ===============================
+// Fungsi untuk format saldo dalam Rupiah
+function formatCurrency(amount) {
+    return new Intl.NumberFormat('id-ID', {
+        style: 'currency',
+        currency: 'IDR',
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 0
+    }).format(amount);
+}
 
-async function processDorTransaction(chatId, messageId = null) {
-    const userData = getUserOtpData(chatId);
-    if (!userData || userData.status !== 'logged_in' || !userData.access_token) {
-        bot.sendMessage(chatId, "⚠️ Sesi login expired atau tidak valid. Silakan login ulang dengan /mintaotp dan /verifotp!");
-        return;
-    }
-
-    const userBalance = getUserBalance(chatId);
-    const packagePrice = getPackagePrice(DOR_CONFIG.packageCode);
+// Fungsi untuk format informasi kuota
+function formatQuotaInfo(quota) {
+    let info = `📦 **${quota.name}**\n`;
+    info += `⏰ Expired: ${quota.expired_at}\n`;
     
-    if (userBalance < packagePrice) {
-        bot.sendMessage(chatId, 
-            `❌ Saldo tidak mencukupi!\n` +
-            `💰 Saldo: Rp ${userBalance.toLocaleString('id-ID')}\n` +
-            `📦 Harga: Rp ${packagePrice.toLocaleString('id-ID')}`
-        );
-        return;
-    }
-
-    const { nomor_hp, access_token } = userData;
-    
-    let statusMsg;
-    if (messageId) {
-        bot.editMessageText("⏳ Memproses pembelian paket...", {
-            chat_id: chatId,
-            message_id: messageId
+    if (quota.benefits && quota.benefits.length > 0) {
+        info += `📊 **Benefits:**\n`;
+        quota.benefits.forEach((benefit, index) => {
+            info += `   ${index + 1}. ${benefit.name}\n`;
+            if (benefit.quota && benefit.remaining_quota) {
+                info += `      💾 Kuota: ${benefit.quota} | Sisa: ${benefit.remaining_quota}\n`;
+            }
+            if (benefit.information) {
+                info += `      ℹ️ Info: ${benefit.information}\n`;
+            }
         });
-    } else {
-        statusMsg = await bot.sendMessage(chatId, "⏳ Memproses pembelian paket...");
-        messageId = statusMsg.message_id;
     }
+    
+    return info;
+}
 
+// Fungsi API
+async function processDorRequest(phone, accessToken, packageCode = DOR_CONFIG.packageCode, paymentMethod = DOR_CONFIG.paymentMethod) {
     try {
-        log('INFO', 'Starting DOR process with balance payment', {
-            chatId,
-            nomor_hp,
-            packageCode: DOR_CONFIG.packageCode,
-            userBalance,
-            packagePrice
+        log('DEBUG', 'Processing DOR request with new API', {
+            phone,
+            packageCode,
+            paymentMethod,
+            accessToken: accessToken.substring(0, 10) + '...'
         });
 
-        // Gunakan BALANCE sebagai payment method
-        const dorResponse = await processDorRequest(nomor_hp, access_token, DOR_CONFIG.packageCode, 'BALANCE');
+        // Konstruksi URL dengan parameter baru
+        const dorUrl = `${DOR_CONFIG.apiUrl}?api_key=${DOR_CONFIG.apiKey}&package_code=${packageCode}&phone=${phone}&access_token=${accessToken}&payment_method=${paymentMethod}`;
+        
+        const response = await axios.get(dorUrl, {
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
 
-        if (dorResponse.status === true && dorResponse.statusCode === 200) {
-            const { data } = dorResponse;
-            
-            // Kurangi balance user
-            const newBalance = updateUserBalance(chatId, packagePrice, 'subtract');
-            
-            // Simpan riwayat transaksi
-            saveTransactionHistory(chatId, {
-                trx_id: data.trx_id,
-                package_name: data.package_name,
-                amount: packagePrice,
-                balance_before: userBalance,
-                balance_after: newBalance,
-                target_number: data.msisdn,
-                timestamp: new Date().toISOString(),
-                status: 'success'
-            });
+        log('INFO', 'DOR request processed with new API', {
+            phone,
+            status: response.data.status,
+            statusCode: response.data.statusCode,
+            trxId: response.data.data?.trx_id,
+            hasDeeplink: response.data.data?.have_deeplink,
+            isQris: response.data.data?.is_qris
+        });
 
-            bot.editMessageText(
-                `✅ *PEMBELIAN BERHASIL!*\n\n` +
-                `📦 *Detail Pembelian:*\n` +
-                `📱 Nomor: ${data.msisdn}\n` +
-                `📋 Paket: ${data.package_name}\n` +
-                `💰 Harga: Rp ${packagePrice.toLocaleString('id-ID')}\n` +
-                `🔖 ID Transaksi: ${data.trx_id}\n\n` +
-                `💳 *Balance Update:*\n` +
-                `• Saldo sebelum: Rp ${userBalance.toLocaleString('id-ID')}\n` +
-                `• Saldo sesudah: Rp ${newBalance.toLocaleString('id-ID')}\n\n` +
-                `✅ Paket berhasil diaktifkan! Terima kasih.`,
-                {
-                    chat_id: chatId,
-                    message_id: messageId,
-                    parse_mode: 'Markdown'
-                }
-            );
-
-            log('INFO', 'DOR with balance completed successfully', {
-                chatId,
-                trxId: data.trx_id,
-                newBalance
-            });
-
-        } else {
-            throw new Error(dorResponse.message || "Gagal memproses pembelian paket");
-        }
-
+        return response.data;
     } catch (error) {
-        log('ERROR', 'DOR process failed', {
+        log('ERROR', 'Failed to process DOR request with new API', {
             error: error.message,
             response: error.response?.data,
-            chatId,
-            nomor_hp
+            phone,
+            packageCode,
+            paymentMethod
         });
-
-        let errorMessage = "Gagal memproses pembelian";
-        if (error.response?.data?.message) {
-            errorMessage = error.response.data.message;
-        } else {
-            errorMessage = error.message;
-        }
-
-        bot.editMessageText(`❌ ${errorMessage}`, {
-            chat_id: chatId,
-            message_id: messageId
-        });
+        throw error;
     }
 }
 
-// ===============================
-// COMMAND HANDLERS
-// ===============================
-
-// Command /start
+// Command handlers
 bot.onText(/\/start/, async (msg) => {
     const chatId = msg.chat.id;
     const menuText = `
-🤖 *Selamat datang di Bot XL DOR!*
+🔥 *XL DOR BOT TELEGRAM*
 
-📋 *CARA PENGGUNAAN:*
+Selamat datang! Bot ini membantu Anda untuk melakukan DOR XL dengan API terbaru.
 
-1️⃣ /mintaotp <nomor>
-   Contoh: /mintaotp 087777334618
-
-2️⃣ /verifotp <kode>
-   Contoh: /verifotp 123456
-
-📦 *PAKET COMMANDS:*
-/listpaket - Lihat semua paket XL
-/caripaket <keyword> - Cari paket tertentu
-/infopaket <code> - Detail paket spesifik
-/setpackage <code> - Set paket untuk pembelian
-
-🛒 *PEMBELIAN:*
-/dor - Info paket dan konfirmasi
+📋 *MENU PERINTAH:*
+/mintaotp <nomor> - Minta kode OTP
+/verifotp <kode> - Verifikasi OTP  
+/kuota - Lihat kuota/paket aktif
+/saldo - Cek saldo akun panel
+/dor - Info paket dan payment
 /lanjutdor - Proses pembelian
-
-💰 *BALANCE COMMANDS:*
-/balance - Cek saldo balance
-/topup - Top up balance
-/history - Riwayat transaksi
-
+/setpackage <code> - Ganti package code
+/setpayment <method> - Ganti payment method (DANA/QRIS/BALANCE)
 /status - Cek status login
 /logout - Logout dan hapus data
 /menu - Tampilkan menu ini
@@ -741,96 +275,112 @@ bot.onText(/\/start/, async (msg) => {
 • Nomor target harus pelanggan XL aktif
 • Sesi login berlaku 1 jam
 • OTP berlaku 5 menit
-• Pembelian menggunakan balance otomatis
+• Metode BALANCE menggunakan saldo panel
 
 📦 *Package saat ini:* ${DOR_CONFIG.packageCode}
-💰 *Balance minimal:* Rp ${DOR_CONFIG.minBalance.toLocaleString('id-ID')}
-`;
-
+💳 *Payment method:* ${DOR_CONFIG.paymentMethod}
+    `;
+    
     bot.sendMessage(chatId, menuText, {parse_mode: 'Markdown'});
     log('INFO', 'New user started bot', { chatId, username: msg.from.username });
 });
 
-// Command /menu
 bot.onText(/\/menu/, async (msg) => {
-    bot.onText(/\/start/, async (msg) => {
-        // Same as /start
-    });
+    const chatId = msg.chat.id;
+    bot.sendMessage(chatId, `
+📋 *CARA PENGGUNAAN:*
+
+1️⃣ /saldo
+   Cek saldo akun panel Anda
+
+2️⃣ /kuota
+   Lihat kuota/paket yang aktif saat ini
+
+3️⃣ /mintaotp <nomor_hp>
+   Contoh: /mintaotp 087777334618
+
+4️⃣ /verifotp <kode_otp>  
+   Contoh: /verifotp 123456
+
+5️⃣ /setpackage <code>
+   Contoh: /setpackage XLUNLITURBOSUPERXCPROMO15K_PL
+
+6️⃣ /setpayment <method>
+   Contoh: /setpayment BALANCE
+
+7️⃣ /dor
+   Untuk info paket dan payment
+
+8️⃣ /lanjutdor
+   Untuk memulai proses pembelian
+
+💡 *Tips:* 
+• Gunakan /saldo untuk mengecek saldo panel
+• Gunakan /kuota untuk melihat paket aktif
+• Pastikan saldo mencukupi sebelum transaksi!
+    `, {parse_mode: 'Markdown'});
 });
 
-// Command /mintaotp
-bot.onText(/\/mintaotp (.+)/, async (msg, match) => {
+// Command untuk cek saldo akun panel
+bot.onText(/\/saldo/, async (msg) => {
     const chatId = msg.chat.id;
-    const nomorHp = match[1].trim();
-
-    // Validasi nomor HP
-    if (!/^08\d{8,12}$/.test(nomorHp)) {
-        bot.sendMessage(chatId,
-            "❌ Format nomor tidak valid!\n\n" +
-            "Format yang benar: 08xxxxxxxxx\n" +
-            "Contoh: 087777334618"
-        );
-        return;
-    }
-
-    const statusMsg = await bot.sendMessage(chatId, "⏳ Mengirim OTP...");
-
+    const statusMsg = await bot.sendMessage(chatId, "⏳ Mengecek saldo akun panel...");
+    
     try {
-        const otpResponse = await requestOtp(nomorHp);
-
-        if (otpResponse.status === true && otpResponse.statusCode === 200) {
-            const { data } = otpResponse;
+        const balanceResponse = await getAccountBalance();
+        
+        if (balanceResponse.status === true && balanceResponse.statusCode === 200) {
+            const balance = balanceResponse.data.balance;
+            const formattedBalance = formatCurrency(balance);
             
-            // Simpan data OTP
-            const otpData = loadOtpData();
-            otpData[chatId] = {
-                auth_id: data.auth_id,
-                nomor_hp: nomorHp,
-                status: 'otp_sent',
-                otp_sent_at: new Date().toISOString(),
-                expires_at: new Date(Date.now() + (5 * 60 * 1000)).toISOString(), // 5 menit
-                can_resend_at: new Date(Date.now() + (data.can_resend_in * 1000)).toISOString()
-            };
-            saveOtpData(otpData);
-
-            bot.editMessageText(
-                `✅ OTP berhasil dikirim!\n\n` +
-                `📱 Silakan cek SMS Anda untuk mendapatkan kode OTP\n` +
-                `Ketik /verifotp <kode> untuk verifikasi\n` +
-                `⏰ Kode berlaku 5 menit\n` +
-                `🔄 Dapat mengirim ulang dalam ${data.can_resend_in} detik`,
-                {
-                    chat_id: chatId,
-                    message_id: statusMsg.message_id
-                }
-            );
-
-            log('INFO', 'OTP request successful', {
-                chatId,
-                targetNumber: nomorHp,
-                authId: data.auth_id,
-                canResendIn: data.can_resend_in
+            const balanceText = `💰 **SALDO AKUN PANEL**\n\n` +
+                              `💳 Saldo Tersedia: **${formattedBalance}**\n` +
+                              `🔢 Nominal: ${balance.toLocaleString('id-ID')}\n` +
+                              `✅ Status: Aktif\n` +
+                              `📅 Dicek pada: ${new Date().toLocaleString('id-ID', {
+                                  timeZone: 'Asia/Jakarta',
+                                  year: 'numeric',
+                                  month: 'long',
+                                  day: 'numeric',
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                  second: '2-digit'
+                              })} WIB\n\n` +
+                              `💡 **Tips:**\n` +
+                              `• Gunakan /setpayment BALANCE untuk menggunakan saldo panel\n` +
+                              `• Pastikan saldo mencukupi sebelum transaksi\n` +
+                              `• Saldo akan terpotong otomatis saat menggunakan metode BALANCE`;
+            
+            bot.editMessageText(balanceText, {
+                chat_id: chatId,
+                message_id: statusMsg.message_id,
+                parse_mode: 'Markdown'
             });
-
+            
+            log('INFO', 'Account balance displayed successfully', {
+                chatId,
+                balance,
+                formattedBalance
+            });
+            
         } else {
-            throw new Error(otpResponse.message || "Gagal mengirim OTP");
+            throw new Error(balanceResponse.message || "Gagal mengambil saldo akun");
         }
-
+        
     } catch (error) {
-        log('ERROR', 'OTP request failed', {
+        log('ERROR', 'Failed to display account balance', {
             error: error.message,
             response: error.response?.data,
-            chatId,
-            nomorHp
+            chatId
         });
-
-        let errorMessage = "Gagal mengirim OTP";
+        
+        let errorMessage = "Gagal mengecek saldo akun panel";
         if (error.response?.data?.message) {
             errorMessage = error.response.data.message;
-        } else {
+        } else if (error.message) {
             errorMessage = error.message;
         }
-
+        
         bot.editMessageText(`❌ ${errorMessage}`, {
             chat_id: chatId,
             message_id: statusMsg.message_id
@@ -838,181 +388,22 @@ bot.onText(/\/mintaotp (.+)/, async (msg, match) => {
     }
 });
 
-// Command /verifotp
-bot.onText(/\/verifotp (.+)/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const otpCode = match[1].trim();
-
-    // Validasi kode OTP
-    if (!/^\d{4,6}$/.test(otpCode)) {
-        bot.sendMessage(chatId,
-            "❌ Format OTP tidak valid!\n\n" +
-            "Format yang benar: 4-6 digit angka\n" +
-            "Contoh: 123456"
-        );
-        return;
-    }
-
-    const userData = getUserOtpData(chatId);
-    if (!userData || userData.status !== 'otp_sent' || !userData.auth_id) {
-        bot.sendMessage(chatId,
-            "⚠️ Anda belum meminta OTP atau OTP sudah expired.\n\n" +
-            "Silakan minta OTP baru dengan /mintaotp <nomor>"
-        );
-        return;
-    }
-
-    // Cek apakah OTP masih berlaku
-    if (new Date() > new Date(userData.expires_at)) {
-        bot.sendMessage(chatId,
-            "⚠️ OTP sudah expired. Silakan minta OTP baru dengan /mintaotp"
-        );
-        return;
-    }
-
-    const statusMsg = await bot.sendMessage(chatId, "⏳ Memverifikasi OTP...");
-
-    try {
-        const verifyResponse = await verifyOtp(userData.auth_id, otpCode);
-
-        if (verifyResponse.status === true && verifyResponse.statusCode === 200) {
-            const { data } = verifyResponse;
-            
-            // Update data user
-            const otpData = loadOtpData();
-            otpData[chatId] = {
-                ...otpData[chatId],
-                access_token: data.access_token,
-                status: 'logged_in',
-                verified_at: new Date().toISOString(),
-                expires_at: new Date(Date.now() + (60 * 60 * 1000)).toISOString() // 1 jam
-            };
-            saveOtpData(otpData);
-
-            bot.editMessageText(
-                `✅ Verifikasi OTP berhasil!\n\n` +
-                `📱 Anda sudah login ke sistem XL\n` +
-                `Ketik /dor untuk melanjutkan pembelian\n` +
-                `⏰ Sesi login berlaku 60 menit\n` +
-                `🔑 Token: ${data.access_token.substring(0, 20)}...`,
-                {
-                    chat_id: chatId,
-                    message_id: statusMsg.message_id
-                }
-            );
-
-            log('INFO', 'OTP verification successful', {
-                chatId,
-                nomorHp: userData.nomor_hp,
-                authId: userData.auth_id
-            });
-
-        } else {
-            throw new Error(verifyResponse.message || "Gagal memverifikasi OTP");
-        }
-
-    } catch (error) {
-        log('ERROR', 'OTP verification failed', {
-            error: error.message,
-            response: error.response?.data,
-            chatId,
-            authId: userData.auth_id
-        });
-
-        let errorMessage = "Gagal memverifikasi OTP";
-        if (error.response?.data?.message) {
-            errorMessage = error.response.data.message;
-        } else {
-            errorMessage = error.message;
-        }
-
-        bot.editMessageText(`❌ ${errorMessage}`, {
-            chat_id: chatId,
-            message_id: statusMsg.message_id
-        });
-    }
-});
-
-// Command /balance
+// Alias command untuk cek saldo
 bot.onText(/\/balance/, async (msg) => {
-    const chatId = msg.chat.id;
-    const balance = getUserBalance(chatId);
-    
-    bot.sendMessage(chatId, 
-        `💰 *BALANCE ANDA*\n\n` +
-        `💳 Saldo: Rp ${balance.toLocaleString('id-ID')}\n` +
-        `📦 Harga paket saat ini: Rp ${getPackagePrice(DOR_CONFIG.packageCode).toLocaleString('id-ID')}\n\n` +
-        `${balance >= getPackagePrice(DOR_CONFIG.packageCode) ? '✅' : '❌'} ` +
-        `${balance >= getPackagePrice(DOR_CONFIG.packageCode) ? 'Saldo mencukupi' : 'Saldo tidak mencukupi'}\n\n` +
-        `Ketik /topup untuk mengisi saldo`,
-        {parse_mode: 'Markdown'}
-    );
+    bot.emit('text', Object.assign({}, msg, { text: '/saldo' }));
 });
 
-// Command /topup
-bot.onText(/\/topup/, async (msg) => {
-    const chatId = msg.chat.id;
-    
-    const keyboard = {
-        inline_keyboard: [
-            [
-                { text: "💰 Top Up Rp 10.000", callback_data: "topup_10000" },
-                { text: "💰 Top Up Rp 25.000", callback_data: "topup_25000" }
-            ],
-            [
-                { text: "💰 Top Up Rp 50.000", callback_data: "topup_50000" },
-                { text: "💰 Top Up Rp 100.000", callback_data: "topup_100000" }
-            ],
-            [
-                { text: "💳 Custom Amount", callback_data: "topup_custom" }
-            ]
-        ]
-    };
-    
-    bot.sendMessage(chatId,
-        `💰 *TOP UP BALANCE*\n\n` +
-        `Pilih nominal yang ingin Anda top up:`,
-        {
-            parse_mode: 'Markdown',
-            reply_markup: keyboard
-        }
-    );
+bot.onText(/\/ceksaldo/, async (msg) => {
+    bot.emit('text', Object.assign({}, msg, { text: '/saldo' }));
 });
 
-// Command /topup_amount untuk custom amount
-bot.onText(/\/topup_amount (.+)/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const amount = parseInt(match[1].trim());
-    
-    if (isNaN(amount) || amount < 1000) {
-        bot.sendMessage(chatId, "⚠️ Nominal minimal Rp 1.000");
-        return;
-    }
-    
-    if (amount > 1000000) {
-        bot.sendMessage(chatId, "⚠️ Nominal maksimal Rp 1.000.000");
-        return;
-    }
-    
-    // Simulasi top up berhasil
-    const newBalance = updateUserBalance(chatId, amount, 'add');
-    
-    bot.sendMessage(chatId,
-        `✅ *TOP UP BERHASIL!*\n\n` +
-        `💰 Nominal: Rp ${amount.toLocaleString('id-ID')}\n` +
-        `💳 Saldo baru: Rp ${newBalance.toLocaleString('id-ID')}\n\n` +
-        `Terima kasih! Saldo Anda telah ditambahkan.`,
-        {parse_mode: 'Markdown'}
-    );
-});
-
-// Command /dor
-bot.onText(/\/dor/, async (msg) => {
+// Command untuk melihat kuota/paket aktif
+bot.onText(/\/kuota/, async (msg) => {
     const chatId = msg.chat.id;
     const userData = getUserOtpData(chatId);
-    
-    if (!userData || userData.status !== 'logged_in') {
-        bot.sendMessage(chatId,
+
+    if (!userData || userData.status !== 'logged_in' || !userData.access_token) {
+        bot.sendMessage(chatId, 
             "⚠️ Anda belum login!\n\n" +
             "Silakan login terlebih dahulu dengan:\n" +
             "1. /mintaotp <nomor>\n" +
@@ -1021,21 +412,355 @@ bot.onText(/\/dor/, async (msg) => {
         return;
     }
 
-    const userBalance = getUserBalance(chatId);
-    const packagePrice = getPackagePrice(DOR_CONFIG.packageCode);
+    const statusMsg = await bot.sendMessage(chatId, "⏳ Mengambil data kuota aktif...");
     
-    if (userBalance < packagePrice) {
-        bot.sendMessage(chatId,
-            `⚠️ *SALDO TIDAK MENCUKUPI* ⚠️\n\n` +
-            `💰 Saldo Anda: Rp ${userBalance.toLocaleString('id-ID')}\n` +
-            `📦 Harga paket: Rp ${packagePrice.toLocaleString('id-ID')}\n` +
-            `❌ Kekurangan: Rp ${(packagePrice - userBalance).toLocaleString('id-ID')}\n\n` +
-            `Silakan top up balance terlebih dahulu dengan /topup`,
-            {parse_mode: 'Markdown'}
+    try {
+        const quotaResponse = await getQuotaDetails(userData.access_token);
+        
+        if (quotaResponse.status === true && quotaResponse.statusCode === 200) {
+            const { data } = quotaResponse;
+            
+            if (!data.quotas || data.quotas.length === 0) {
+                bot.editMessageText(
+                    `📱 **KUOTA AKTIF**\n\n` +
+                    `📞 Nomor: ${data.msisdn}\n` +
+                    `❌ Tidak ada paket/kuota yang aktif saat ini\n\n` +
+                    `💡 Gunakan /dor untuk membeli paket baru`,
+                    {
+                        chat_id: chatId,
+                        message_id: statusMsg.message_id,
+                        parse_mode: 'Markdown'
+                    }
+                );
+                return;
+            }
+            
+            // Bagi kuota menjadi beberapa pesan jika terlalu panjang
+            const quotasPerMessage = 3;
+            const totalPages = Math.ceil(data.quotas.length / quotasPerMessage);
+            
+            for (let page = 0; page < totalPages; page++) {
+                const startIndex = page * quotasPerMessage;
+                const endIndex = Math.min(startIndex + quotasPerMessage, data.quotas.length);
+                const pageQuotas = data.quotas.slice(startIndex, endIndex);
+                
+                let messageText = `📱 **KUOTA AKTIF** (${page + 1}/${totalPages})\n\n`;
+                messageText += `📞 Nomor: ${data.msisdn}\n`;
+                messageText += `📝 ${data.text}\n\n`;
+                
+                pageQuotas.forEach((quota, index) => {
+                    messageText += formatQuotaInfo(quota);
+                    if (index < pageQuotas.length - 1) {
+                        messageText += '\n' + '─'.repeat(30) + '\n\n';
+                    }
+                });
+                
+                messageText += `\n💡 **Tips:**\n`;
+                messageText += `• /kuota - Refresh data kuota\n`;
+                messageText += `• /dor - Beli paket baru\n`;
+                messageText += `• /status - Cek status login`;
+                
+                if (page === 0) {
+                    // Edit pesan pertama
+                    bot.editMessageText(messageText, {
+                        chat_id: chatId,
+                        message_id: statusMsg.message_id,
+                        parse_mode: 'Markdown'
+                    });
+                } else {
+                    // Kirim pesan baru untuk halaman selanjutnya
+                    bot.sendMessage(chatId, messageText, {
+                        parse_mode: 'Markdown'
+                    });
+                }
+                
+                // Delay antar pesan untuk menghindari rate limit
+                if (page < totalPages - 1) {
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+            }
+            
+            log('INFO', 'Quota details displayed successfully', {
+                chatId,
+                msisdn: data.msisdn,
+                totalQuotas: data.quotas.length,
+                totalPages
+            });
+            
+        } else {
+            throw new Error(quotaResponse.message || "Gagal mengambil data kuota");
+        }
+        
+    } catch (error) {
+        log('ERROR', 'Failed to display quota details', {
+            error: error.message,
+            response: error.response?.data,
+            chatId
+        });
+        
+        let errorMessage = "Gagal mengambil data kuota aktif";
+        if (error.response?.data?.message) {
+            errorMessage = error.response.data.message;
+        } else if (error.message.includes('access_token')) {
+            errorMessage = "Access token tidak valid, silakan login ulang";
+        } else if (error.message) {
+            errorMessage = error.message;
+        }
+        
+        bot.editMessageText(`❌ ${errorMessage}`, {
+            chat_id: chatId,
+            message_id: statusMsg.message_id
+        });
+    }
+});
+
+// Alias command untuk kuota
+bot.onText(/\/paketaktif/, async (msg) => {
+    bot.emit('text', Object.assign({}, msg, { text: '/kuota' }));
+});
+
+bot.onText(/\/cekquota/, async (msg) => {
+    bot.emit('text', Object.assign({}, msg, { text: '/kuota' }));
+});
+
+bot.onText(/\/mintaotp (.+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const nomor_hp = match[1].trim();
+    
+    log('DEBUG', 'Received mintaotp command', { chatId, targetNumber: nomor_hp });
+    
+    if (!nomor_hp) {
+        bot.sendMessage(chatId, "⚠️ Format: /mintaotp <nomor_hp>\nContoh: /mintaotp 087777334618");
+        return;
+    }
+
+    const statusMsg = await bot.sendMessage(chatId, "⏳ Meminta OTP...");
+    
+    try {
+        log('INFO', 'Making OTP request', { targetNumber: nomor_hp });
+        
+        // Konstruksi URL dengan query parameters
+        const otpUrl = `${OTP_CONFIG.requestUrl}?api_key=${OTP_CONFIG.apiKey}&phone=${nomor_hp}&method=OTP`;
+        
+        const response = await axios.get(otpUrl, {
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
+
+        // Handle response dengan struktur baru
+        if (response.data.status === true && response.data.statusCode === 200) {
+            const { data } = response.data;
+            const expires_in = data.can_resend_in || 300; // Default 5 menit jika tidak ada
+            
+            updateUserOtpData(chatId, {
+                nomor_hp: nomor_hp,
+                auth_id: data.auth_id, // Simpan auth_id dari response
+                expires_in: expires_in,
+                can_resend_in: data.can_resend_in,
+                status: 'waiting_verification',
+                expires_at: Date.now() + (expires_in * 1000)
+            });
+
+            log('INFO', 'OTP request successful', {
+                chatId,
+                targetNumber: nomor_hp,
+                authId: data.auth_id,
+                canResendIn: data.can_resend_in
+            });
+
+            bot.editMessageText(
+                "✅ OTP berhasil dikirim!\n\n" +
+                "📱 Silakan cek SMS Anda untuk mendapatkan kode OTP\n" +
+                "Ketik /verifotp <kode> untuk verifikasi\n" +
+                `⏰ Kode berlaku ${Math.floor(expires_in / 60)} menit\n` +
+                `🔄 Dapat mengirim ulang dalam ${data.can_resend_in} detik`,
+                {
+                    chat_id: chatId,
+                    message_id: statusMsg.message_id
+                }
+            );
+
+            // Auto delete expired OTP data
+            setTimeout(() => {
+                const currentData = getUserOtpData(chatId);
+                if (currentData && currentData.status === 'waiting_verification') {
+                    log('INFO', 'OTP expired', { chatId });
+                    deleteUserOtpData(chatId);
+                }
+            }, expires_in * 1000);
+            
+        } else {
+            throw new Error(response.data.message || "Gagal meminta OTP");
+        }
+        
+    } catch (error) {
+        log('ERROR', 'OTP request failed', {
+            error: error.message,
+            response: error.response?.data,
+            nomor_hp
+        });
+        
+        // Handle specific error messages dari API
+        let errorMessage = "Gagal meminta OTP";
+        if (error.response?.data?.message) {
+            errorMessage = error.response.data.message;
+        } else if (error.message) {
+            errorMessage = error.message;
+        }
+        
+        bot.editMessageText(`❌ ${errorMessage}`, {
+            chat_id: chatId,
+            message_id: statusMsg.message_id
+        });
+    }
+});
+
+bot.onText(/\/verifotp (.+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const kode_otp = match[1].trim();
+    const userData = getUserOtpData(chatId);
+
+    log('DEBUG', 'Received verifotp command', {
+        chatId,
+        status: userData?.status,
+        expiresAt: userData?.expires_at,
+        authId: userData?.auth_id
+    });
+
+    if (!userData) {
+        log('WARN', 'User not found or no OTP data', { chatId });
+        bot.sendMessage(chatId, "⚠️ Silakan ketik /mintaotp <nomor> terlebih dahulu!");
+        return;
+    }
+
+    if (userData.expires_at && Date.now() > userData.expires_at) {
+        log('WARN', 'OTP expired', { chatId });
+        deleteUserOtpData(chatId);
+        bot.sendMessage(chatId, "⚠️ OTP sudah expired. Silakan minta OTP baru dengan /mintaotp");
+        return;
+    }
+
+    if (userData.status !== 'waiting_verification') {
+        log('WARN', 'Invalid OTP status', { chatId, status: userData.status });
+        bot.sendMessage(chatId, "⚠️ OTP sudah tidak valid. Silakan minta OTP baru dengan /mintaotp");
+        return;
+    }
+
+    // Validasi auth_id ada
+    if (!userData.auth_id) {
+        log('ERROR', 'Missing auth_id in user data', { chatId });
+        bot.sendMessage(chatId, "⚠️ Data OTP tidak lengkap. Silakan minta OTP baru dengan /mintaotp");
+        return;
+    }
+
+    const statusMsg = await bot.sendMessage(chatId, "⏳ Memverifikasi OTP...");
+    
+    try {
+        const { nomor_hp, auth_id } = userData;
+        log('INFO', 'Verifying OTP with new API', {
+            chatId,
+            targetNumber: nomor_hp,
+            authId: auth_id,
+            otpCode: kode_otp
+        });
+
+        // Konstruksi URL dengan parameter baru
+        const verifyUrl = `${OTP_CONFIG.verifyUrl}?api_key=${OTP_CONFIG.apiKey}&phone=${nomor_hp}&method=OTP&auth_id=${auth_id}&otp=${kode_otp}`;
+        
+        const response = await axios.get(verifyUrl, {
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
+
+        // Handle response dengan struktur baru
+        if (response.data.status === true && response.data.statusCode === 200) {
+            const { data } = response.data;
+            const login_expires_in = 3600; // Default 1 jam karena tidak ada expires_in dari API baru
+
+            updateUserOtpData(chatId, {
+                ...userData,
+                access_token: data.access_token,
+                status: 'logged_in',
+                expires_at: Date.now() + (login_expires_in * 1000),
+                verified_at: new Date().toISOString()
+            });
+
+            log('INFO', 'OTP verification successful with new API', {
+                chatId,
+                accessToken: data.access_token.substring(0, 10) + '...', // Log partial token untuk security
+                expiresIn: login_expires_in
+            });
+
+            bot.editMessageText(
+                "✅ Verifikasi OTP berhasil!\n\n" +
+                "📱 Anda sudah login ke sistem XL\n" +
+                "Ketik /dor untuk melanjutkan pembelian\n" +
+                `⏰ Sesi login berlaku ${Math.floor(login_expires_in / 60)} menit\n` +
+                `🔑 Token: ${data.access_token.substring(0, 15)}...`,
+                {
+                    chat_id: chatId,
+                    message_id: statusMsg.message_id
+                }
+            );
+
+            // Auto logout after expiration
+            setTimeout(() => {
+                const currentData = getUserOtpData(chatId);
+                if (currentData && currentData.status === 'logged_in') {
+                    log('INFO', 'Login session expired', { chatId });
+                    deleteUserOtpData(chatId);
+                }
+            }, login_expires_in * 1000);
+            
+        } else {
+            throw new Error(response.data.message || "Gagal verifikasi OTP");
+        }
+        
+    } catch (error) {
+        log('ERROR', 'OTP verification failed with new API', {
+            error: error.message,
+            response: error.response?.data,
+            chatId,
+            kode_otp,
+            auth_id: userData.auth_id
+        });
+        
+        // Handle specific error messages dari API
+        let errorMessage = "Gagal verifikasi OTP";
+        if (error.response?.data?.message) {
+            errorMessage = error.response.data.message;
+        } else if (error.message.includes('auth_id')) {
+            errorMessage = "Auth ID tidak valid, silakan minta OTP baru";
+        } else if (error.message.includes('otp')) {
+            errorMessage = "Kode OTP salah atau expired";
+        } else {
+            errorMessage = error.message;
+        }
+        
+        bot.editMessageText(`❌ ${errorMessage}`, {
+            chat_id: chatId,
+            message_id: statusMsg.message_id
+        });
+    }
+});
+
+bot.onText(/\/dor/, async (msg) => {
+    const chatId = msg.chat.id;
+    const userData = getUserOtpData(chatId);
+
+    if (!userData || userData.status !== 'logged_in') {
+        bot.sendMessage(chatId, 
+            "⚠️ Anda belum login!\n\n" +
+            "Silakan login terlebih dahulu dengan:\n" +
+            "1. /mintaotp <nomor>\n" +
+            "2. /verifotp <kode>"
         );
         return;
     }
 
+    // Inline keyboard untuk konfirmasi
     const keyboard = {
         inline_keyboard: [
             [
@@ -1046,15 +771,17 @@ bot.onText(/\/dor/, async (msg) => {
     };
 
     bot.sendMessage(chatId,
-        `⚠️ *KONFIRMASI PEMBELIAN PAKET* ⚠️\n\n` +
+        "⚠️ *INFORMASI PEMBELIAN PAKET* ⚠️\n\n" +
         `📦 *Paket yang akan dibeli:*\n` +
         `${DOR_CONFIG.packageCode}\n\n` +
-        `💰 *Detail Pembayaran:*\n` +
-        `• Saldo saat ini: Rp ${userBalance.toLocaleString('id-ID')}\n` +
-        `• Harga paket: Rp ${packagePrice.toLocaleString('id-ID')}\n` +
-        `• Sisa saldo: Rp ${(userBalance - packagePrice).toLocaleString('id-ID')}\n\n` +
-        `💳 *Metode Pembayaran:* BALANCE (Otomatis)\n\n` +
-        `Klik tombol di bawah untuk melanjutkan atau batalkan`,
+        `💳 *Metode Pembayaran:*\n` +
+        `${DOR_CONFIG.paymentMethod}\n\n` +
+        "📱 *Perhatian:*\n" +
+        "• Pastikan nomor target dapat menerima paket\n" +
+        "• Pastikan aplikasi DANA aktif (jika menggunakan DANA)\n" +
+        "• QR Code berlaku terbatas (jika menggunakan QRIS)\n" +
+        "• Saldo panel akan terpotong (jika menggunakan BALANCE)\n\n" +
+        "Klik tombol di bawah untuk melanjutkan atau batalkan",
         {
             parse_mode: 'Markdown',
             reply_markup: keyboard
@@ -1062,785 +789,349 @@ bot.onText(/\/dor/, async (msg) => {
     );
 });
 
-// Command /lanjutdor
 bot.onText(/\/lanjutdor/, async (msg) => {
     const chatId = msg.chat.id;
     await processDorTransaction(chatId);
 });
 
-// Command /status
-bot.onText(/\/status/, async (msg) => {
-    const chatId = msg.chat.id;
-    const userData = getUserOtpData(chatId);
-    const balance = getUserBalance(chatId);
-
-    if (!userData) {
-        bot.sendMessage(chatId,
-            "📊 *STATUS AKUN*\n\n" +
-            "❌ Belum login\n" +
-            `💳 Balance: Rp ${balance.toLocaleString('id-ID')}\n\n` +
-            "Ketik /mintaotp <nomor> untuk login"
+// Callback query handler untuk inline buttons
+bot.on('callback_query', async (callbackQuery) => {
+    const chatId = callbackQuery.message.chat.id;
+    const data = callbackQuery.data;
+    
+    if (data === 'confirm_dor') {
+        await processDorTransaction(chatId, callbackQuery.message.message_id);
+    } else if (data === 'cancel_dor') {
+        bot.editMessageText(
+            "❌ Transaksi dibatalkan",
+            {
+                chat_id: chatId,
+                message_id: callbackQuery.message.message_id
+            }
         );
+    }
+    
+    bot.answerCallbackQuery(callbackQuery.id);
+});
+
+async function processDorTransaction(chatId, messageId = null) {
+    const userData = getUserOtpData(chatId);
+    
+    if (!userData || userData.status !== 'logged_in' || !userData.access_token) {
+        bot.sendMessage(chatId, "⚠️ Sesi login expired atau tidak valid. Silakan login ulang dengan /mintaotp dan /verifotp!");
         return;
     }
 
-    let statusText = "📊 *STATUS AKUN*\n\n";
-    statusText += `👤 User ID: ${chatId}\n`;
-    statusText += `📱 Target: ${userData.nomor_hp || 'N/A'}\n`;
-    statusText += `📊 Status: ${userData.status}\n`;
-    statusText += `💳 Balance: Rp ${balance.toLocaleString('id-ID')}\n`;
-
-    if (userData.status === 'logged_in' && userData.expires_at) {
-        const expiresAt = new Date(userData.expires_at);
-        const now = new Date();
-        const timeLeft = Math.max(0, Math.floor((expiresAt - now) / 1000 / 60));
-        statusText += `⏰ Sisa waktu: ${timeLeft}m\n`;
-    }
-
-    statusText += `📦 Package: ${DOR_CONFIG.packageCode}\n`;
-    statusText += `💳 Payment: BALANCE\n`;
-
-    if (userData.access_token) {
-        statusText += `🔑 Token: ${userData.access_token.substring(0, 20)}...\n`;
-    }
-
-    bot.sendMessage(chatId, statusText, {parse_mode: 'Markdown'});
-});
-
-// Command /logout
-bot.onText(/\/logout/, async (msg) => {
-    const chatId = msg.chat.id;
+    const { nomor_hp, access_token } = userData;
     
-    const otpData = loadOtpData();
-    if (otpData[chatId]) {
-        delete otpData[chatId];
-        saveOtpData(otpData);
-        
-        bot.sendMessage(chatId,
-            "✅ Logout berhasil!\n\n" +
-            "Data sesi Anda telah dihapus.\n" +
-            "Ketik /start untuk memulai lagi."
-        );
-        
-        log('INFO', 'User logged out', { chatId });
+    let statusMsg;
+    if (messageId) {
+        bot.editMessageText("⏳ Mengecek saldo dan memproses pembelian...", {
+            chat_id: chatId,
+            message_id: messageId
+        });
     } else {
-        bot.sendMessage(chatId, "⚠️ Anda belum login");
+        statusMsg = await bot.sendMessage(chatId, "⏳ Mengecek saldo dan memproses pembelian...");
+        messageId = statusMsg.message_id;
     }
-});
+    
+    try {
+        // Cek saldo terlebih dahulu jika menggunakan metode BALANCE
+        if (DOR_CONFIG.paymentMethod === 'BALANCE') {
+            try {
+                const balanceResponse = await getAccountBalance();
+                if (balanceResponse.status === true) {
+                    const balance = balanceResponse.data.balance;
+                    log('INFO', 'Current account balance before transaction', {
+                        chatId,
+                        balance,
+                        formattedBalance: formatCurrency(balance)
+                    });
+                    
+                    // Update status message dengan info saldo
+                    bot.editMessageText(`⏳ Saldo: ${formatCurrency(balance)} - Memproses pembelian...`, {
+                        chat_id: chatId,
+                        message_id: messageId
+                    });
+                    
+                    // Validasi saldo minimum (opsional)
+                    if (balance < 1000) {
+                        throw new Error("Saldo tidak mencukupi untuk melakukan transaksi");
+                    }
+                }
+            } catch (balanceError) {
+                log('ERROR', 'Failed to check balance before transaction', {
+                    error: balanceError.message,
+                    chatId
+                });
+                
+                if (balanceError.message.includes('Saldo tidak mencukupi')) {
+                    bot.editMessageText(`❌ ${balanceError.message}`, {
+                        chat_id: chatId,
+                        message_id: messageId
+                    });
+                    return;
+                }
+                // Lanjutkan transaksi meskipun gagal cek saldo untuk alasan lain
+            }
+        }
+        
+        log('INFO', 'Starting DOR process with new API', {
+            chatId,
+            nomor_hp,
+            packageCode: DOR_CONFIG.packageCode,
+            paymentMethod: DOR_CONFIG.paymentMethod
+        });
 
-// Command /setpackage
+        const dorResponse = await processDorRequest(nomor_hp, access_token, DOR_CONFIG.packageCode, DOR_CONFIG.paymentMethod);
+        
+        if (dorResponse.status === true && dorResponse.statusCode === 200) {
+            const { data } = dorResponse;
+            
+            // Handle DANA Deeplink
+            if (data.have_deeplink && data.deeplink_data?.deeplink_url) {
+                bot.editMessageText(
+                    `✅ ${dorResponse.message}\n\n` +
+                    `📦 *Detail Pembelian:*\n` +
+                    `📱 Nomor: ${data.msisdn}\n` +
+                    `📋 Paket: ${data.package_name}\n` +
+                    `💰 Fee: Rp ${data.package_processing_fee}\n` +
+                    `🔖 ID Transaksi: ${data.trx_id}\n` +
+                    `💳 Metode: ${data.deeplink_data.payment_method}\n\n` +
+                    `🔗 *Link Pembayaran DANA:*\n` +
+                    `${data.deeplink_data.deeplink_url}\n\n` +
+                    `⏰ Segera lakukan pembayaran melalui aplikasi DANA!`,
+                    {
+                        chat_id: chatId,
+                        message_id: messageId,
+                        parse_mode: 'Markdown'
+                    }
+                );
+                
+                log('INFO', 'DOR with DANA deeplink completed', {
+                    chatId,
+                    trxId: data.trx_id,
+                    paymentMethod: data.deeplink_data.payment_method
+                });
+            }
+            // Handle QRIS
+            else if (data.is_qris && data.qris_data?.qr_code) {
+                const qrBuffer = await QRCode.toBuffer(data.qris_data.qr_code);
+                const remainingMinutes = Math.floor(data.qris_data.remaining_time / 60);
+                const remainingSeconds = data.qris_data.remaining_time % 60;
+                
+                bot.editMessageText("✅ QR Code pembayaran berhasil dibuat!", {
+                    chat_id: chatId,
+                    message_id: messageId
+                });
+                
+                bot.sendPhoto(chatId, qrBuffer, {
+                    caption: `${dorResponse.message}\n\n` +
+                            `📦 *Detail Pembelian:*\n` +
+                            `📱 Nomor: ${data.msisdn}\n` +
+                            `📋 Paket: ${data.package_name}\n` +
+                            `💰 Fee: Rp ${data.package_processing_fee}\n` +
+                            `🔖 ID Transaksi: ${data.trx_id}\n` +
+                            `💳 Metode: QRIS\n\n` +
+                            `⏰ Waktu pembayaran: ${remainingMinutes} menit ${remainingSeconds} detik\n` +
+                            `📅 Expired pada: ${new Date(data.qris_data.payment_expired_at * 1000).toLocaleString('id-ID')}\n\n` +
+                            `Scan QR Code di atas dengan E-Wallet atau Mobile Banking Anda!`,
+                    parse_mode: 'Markdown'
+                });
+                
+                log('INFO', 'DOR with QRIS completed', {
+                    chatId,
+                    trxId: data.trx_id,
+                    remainingTime: data.qris_data.remaining_time
+                });
+            }
+            // Handle response untuk metode BALANCE (direct success)
+            else {
+                let successMessage = `✅ ${dorResponse.message}\n\n` +
+                    `📦 *Detail Pembelian:*\n` +
+                    `📱 Nomor: ${data.msisdn}\n` +
+                    `📋 Paket: ${data.package_name}\n` +
+                    `💰 Fee: Rp ${data.package_processing_fee}\n` +
+                    `🔖 ID Transaksi: ${data.trx_id}\n`;
+                
+                // Tambahkan info khusus untuk metode BALANCE
+                if (DOR_CONFIG.paymentMethod === 'BALANCE') {
+                    successMessage += `💳 Metode: BALANCE (Saldo Panel)\n\n` +
+                        `✅ Pembayaran berhasil menggunakan saldo panel!\n` +
+                        `💡 Gunakan /saldo untuk mengecek sisa saldo terbaru`;
+                } else {
+                    successMessage += `\n✅ Transaksi berhasil diproses!`;
+                }
+                
+                bot.editMessageText(successMessage, {
+                    chat_id: chatId,
+                    message_id: messageId,
+                    parse_mode: 'Markdown'
+                });
+                
+                log('INFO', 'DOR direct success completed', {
+                    chatId,
+                    trxId: data.trx_id,
+                    paymentMethod: DOR_CONFIG.paymentMethod
+                });
+            }
+            
+            // Clean up user data setelah berhasil
+            deleteUserOtpData(chatId);
+            
+        } else {
+            throw new Error(dorResponse.message || "Gagal memproses pembelian paket");
+        }
+        
+    } catch (error) {
+        log('ERROR', 'DOR process failed with new API', {
+            error: error.message,
+            response: error.response?.data,
+            chatId,
+            nomor_hp
+        });
+        
+        let errorMessage = "Gagal memproses pembelian";
+        if (error.response?.data?.message) {
+            errorMessage = error.response.data.message;
+        } else if (error.message.includes('access_token')) {
+            errorMessage = "Access token tidak valid, silakan login ulang";
+        } else if (error.message.includes('saldo')) {
+            errorMessage = "Saldo tidak mencukupi untuk transaksi ini";
+        } else {
+            errorMessage = error.message;
+        }
+        
+        bot.editMessageText(`❌ ${errorMessage}`, {
+            chat_id: chatId,
+            message_id: messageId
+        });
+    }
+}
+
 bot.onText(/\/setpackage (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
     const packageCode = match[1].trim();
     
-    // Validasi package code (bisa ditambahkan validasi ke API)
-    DOR_CONFIG.packageCode = packageCode;
-    
-    // Simpan ke user data juga
-    const otpData = loadOtpData();
-    if (otpData[chatId]) {
-        otpData[chatId].selected_package = packageCode;
-        saveOtpData(otpData);
+    if (!packageCode) {
+        bot.sendMessage(chatId, 
+            "⚠️ Format: /setpackage <package_code>\n" +
+            "Contoh: /setpackage XL_EDU_2GB_1K_DANA"
+        );
+        return;
     }
     
-    bot.sendMessage(chatId,
-        `✅ Package berhasil diubah!\n\n` +
-        `📦 Package baru: ${packageCode}\n` +
-        `💰 Estimasi harga: Rp ${getPackagePrice(packageCode).toLocaleString('id-ID')}\n\n` +
-        `Ketik /dor untuk melanjutkan pembelian dengan package ini.`
-    );
-    
+    DOR_CONFIG.packageCode = packageCode;
+    bot.sendMessage(chatId, `✅ Package code diubah menjadi: ${packageCode}`);
     log('INFO', 'Package code changed', { chatId, newPackageCode: packageCode });
 });
 
-// ===============================
-// PACKAGE LIST COMMANDS
-// ===============================
-
-// Command /listpaket
-bot.onText(/\/listpaket/, async (msg) => {
+bot.onText(/\/setpayment (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
+    const paymentMethod = match[1].trim().toUpperCase();
     
-    const statusMsg = await bot.sendMessage(chatId, "⏳ Mengambil daftar paket XL dari server...");
-    
-    try {
-        const packages = await fetchPackageList();
-        
-        if (!packages || packages.length === 0) {
-            bot.editMessageText("❌ Tidak ada paket yang tersedia saat ini", {
-                chat_id: chatId,
-                message_id: statusMsg.message_id
-            });
-            return;
-        }
-
-        // Tampilkan halaman pertama dengan pagination
-        await showPackageListPage(chatId, statusMsg.message_id, packages, 1);
-        
-    } catch (error) {
-        bot.editMessageText(
-            `❌ Gagal mengambil daftar paket: ${error.message}\n\n` +
-            `Silakan coba lagi atau hubungi admin jika masalah berlanjut.`,
-            {
-                chat_id: chatId,
-                message_id: statusMsg.message_id
-            }
+    if (!paymentMethod || !['DANA', 'QRIS', 'BALANCE'].includes(paymentMethod)) {
+        bot.sendMessage(chatId, 
+            "⚠️ Format: /setpayment <method>\n" +
+            "Pilihan: DANA, QRIS, atau BALANCE\n" +
+            "Contoh: /setpayment BALANCE"
         );
-    }
-});
-
-// Command /caripaket
-bot.onText(/\/caripaket (.+)/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const keyword = match[1].trim().toLowerCase();
-    
-    if (keyword.length < 2) {
-        bot.sendMessage(chatId, "⚠️ Keyword minimal 2 karakter");
         return;
     }
     
-    const statusMsg = await bot.sendMessage(chatId, `🔍 Mencari paket dengan keyword: "*${keyword}*"...`, {parse_mode: 'Markdown'});
+    DOR_CONFIG.paymentMethod = paymentMethod;
+    bot.sendMessage(chatId, `✅ Payment method diubah menjadi: ${paymentMethod}`);
+    log('INFO', 'Payment method changed', { chatId, newPaymentMethod: paymentMethod });
+});
+
+bot.onText(/\/status/, async (msg) => {
+    const chatId = msg.chat.id;
+    const userData = getUserOtpData(chatId);
     
-    try {
-        const packages = await fetchPackageList();
-        
-        // Filter paket berdasarkan keyword
-        const filteredPackages = packages.filter(pkg => 
-            pkg.package_name.toLowerCase().includes(keyword) ||
-            pkg.package_code.toLowerCase().includes(keyword) ||
-            (pkg.package_description && pkg.package_description.toLowerCase().includes(keyword))
-        );
-        
-        if (filteredPackages.length === 0) {
-            bot.editMessageText(
-                `🔍 *HASIL PENCARIAN*\n\n` +
-                `❌ Tidak ditemukan paket dengan keyword: "*${keyword}*"\n\n` +
-                `💡 *Tips pencarian:*\n` +
-                `• Coba kata kunci lain seperti "unlimited", "combo", "2gb"\n` +
-                `• Gunakan kata kunci yang lebih umum\n` +
-                `• Ketik /listpaket untuk melihat semua paket`,
-                {
-                    chat_id: chatId,
-                    message_id: statusMsg.message_id,
-                    parse_mode: 'Markdown'
-                }
-            );
-            return;
-        }
-
-        // Tampilkan hasil pencarian
-        await showSearchResults(chatId, statusMsg.message_id, filteredPackages, keyword, 1);
-        
-    } catch (error) {
-        bot.editMessageText(
-            `❌ Gagal mencari paket: ${error.message}`,
-            {
-                chat_id: chatId,
-                message_id: statusMsg.message_id
-            }
-        );
+    if (!userData) {
+        bot.sendMessage(chatId, "📊 *Status:* Belum login", {parse_mode: 'Markdown'});
+        return;
     }
-});
-
-// Command /infopaket
-bot.onText(/\/infopaket (.+)/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const packageCode = match[1].trim();
     
-    const statusMsg = await bot.sendMessage(chatId, "⏳ Mengambil detail paket...");
+    const remainingTime = userData.expires_at ? Math.max(0, Math.floor((userData.expires_at - Date.now()) / 1000)) : 0;
+    const minutes = Math.floor(remainingTime / 60);
+    const seconds = remainingTime % 60;
     
-    try {
-        const packages = await fetchPackageList();
-        const pkg = packages.find(p => p.package_code === packageCode);
-        
-        if (!pkg) {
-            bot.editMessageText(
-                `❌ *PAKET TIDAK DITEMUKAN*\n\n` +
-                `🔖 Code: \`${packageCode}\`\n\n` +
-                `💡 Pastikan code paket benar atau ketik /listpaket untuk melihat daftar yang tersedia.`,
-                {
-                    chat_id: chatId,
-                    message_id: statusMsg.message_id,
-                    parse_mode: 'Markdown'
-                }
-            );
-            return;
-        }
-
-        await showPackageDetail(chatId, statusMsg.message_id, pkg);
-        
-    } catch (error) {
-        bot.editMessageText(
-            `❌ Gagal mengambil detail paket: ${error.message}`,
-            {
-                chat_id: chatId,
-                message_id: statusMsg.message_id
-            }
-        );
-    }
+    bot.sendMessage(chatId,
+        `📊 *STATUS AKUN*\n\n` +
+        `👤 User ID: ${chatId}\n` +
+        `📱 Target: ${userData.nomor_hp || 'N/A'}\n` +
+        `📊 Status: ${userData.status || 'Unknown'}\n` +
+        `⏰ Sisa waktu: ${minutes}m ${seconds}s\n` +
+        `📦 Package: ${DOR_CONFIG.packageCode}\n` +
+        `💳 Payment: ${DOR_CONFIG.paymentMethod}\n` +
+        `🔑 Token: ${userData.access_token ? userData.access_token.substring(0, 15) + '...' : 'N/A'}`,
+        {parse_mode: 'Markdown'}
+    );
 });
 
-// ===============================
-// ADMIN COMMANDS
-// ===============================
-
-// Command /admin
-bot.onText(/\/admin/, async (msg) => {
+bot.onText(/\/logout/, async (msg) => {
     const chatId = msg.chat.id;
-
-    if (!isAdmin(chatId)) {
-        bot.sendMessage(chatId, "❌ Anda tidak memiliki akses admin!");
+    const userData = getUserOtpData(chatId);
+    
+    if (!userData) {
+        bot.sendMessage(chatId, "⚠️ Anda belum login.");
         return;
     }
-
-    const adminMenu = `
-🔧 *ADMIN PANEL*
-
-💰 **Balance Management:**
-/admin_topup [user_id] [amount] [reason] - Top up user balance
-/admin_setbalance [user_id] [amount] [reason] - Set user balance
-/admin_checkbalance [user_id] - Cek balance user
-
-📊 **User Management:**
-/admin_history [user_id] - Riwayat transaksi user  
-/admin_userinfo [user_id] - Info lengkap user
-/admin_stats - Statistik bot
-
-📋 **System:**
-/admin_broadcast [message] - Broadcast ke semua user
-/admin_logs - Lihat log sistem
-/admin_backup - Backup data
-
-👥 **Super Admin Only:**
-/admin_add [user_id] - Tambah admin baru
-/admin_remove [user_id] - Hapus admin
-
-**Contoh penggunaan:**
-/admin_topup 123456789 50000 Bonus
-/admin_setbalance 123456789 100000 Reset balance
-/admin_checkbalance 123456789
-`;
-
-    bot.sendMessage(chatId, adminMenu, {parse_mode: 'Markdown'});
+    
+    deleteUserOtpData(chatId);
+    bot.sendMessage(chatId, "✅ Logout berhasil! Data sesi telah dihapus.");
+    log('INFO', 'User logged out', { chatId });
 });
 
-// Command /admin_topup
-bot.onText(/\/admin_topup (\d+) (\d+) ?(.*)/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const targetUserId = parseInt(match[1]);
-    const amount = parseInt(match[2]);
-    const reason = match[3] || 'Admin top up';
-
-    // Validasi admin
-    if (!isAdmin(chatId)) {
-        bot.sendMessage(chatId, "❌ Anda tidak memiliki akses admin!");
-        return;
-    }
-
-    if (amount < 100) {
-        bot.sendMessage(chatId, "⚠️ Minimal top up Rp 100");
-        return;
-    }
-
-    if (amount > 10000000) {
-        bot.sendMessage(chatId, "⚠️ Maksimal top up Rp 10.000.000");
-        return;
-    }
-
-    try {
-        // Top up balance user
-        const oldBalance = getUserBalance(targetUserId);
-        const newBalance = updateUserBalance(targetUserId, amount, 'add');
-        
-        // Simpan log admin action
-        saveAdminAction(chatId, {
-            action: 'TOPUP_USER',
-            target_user_id: targetUserId,
-            amount: amount,
-            old_balance: oldBalance,
-            new_balance: newBalance,
-            reason: reason,
-            timestamp: new Date().toISOString()
-        });
-
-        // Kirim konfirmasi ke admin
-        bot.sendMessage(chatId,
-            `✅ *TOP UP BERHASIL*\n\n` +
-            `👤 Target User: ${targetUserId}\n` +
-            `💰 Jumlah Top Up: Rp ${amount.toLocaleString('id-ID')}\n` +
-            `💳 Balance Lama: Rp ${oldBalance.toLocaleString('id-ID')}\n` +
-            `💳 Balance Baru: Rp ${newBalance.toLocaleString('id-ID')}\n` +
-            `📝 Alasan: ${reason}\n` +
-            `👨‍💼 Admin: ${msg.from.first_name} (${chatId})`,
-            {parse_mode: 'Markdown'}
-        );
-
-        // Kirim notifikasi ke user target (jika user aktif)
-        try {
-            bot.sendMessage(targetUserId,
-                `🎉 *BALANCE TOP UP*\n\n` +
-                `💰 Anda mendapat top up sebesar Rp ${amount.toLocaleString('id-ID')}\n` +
-                `💳 Balance baru: Rp ${newBalance.toLocaleString('id-ID')}\n` +
-                `📝 Keterangan: ${reason}\n` +
-                `⏰ Waktu: ${new Date().toLocaleString('id-ID')}\n\n` +
-                `Terima kasih! 🙏`,
-                {parse_mode: 'Markdown'}
-            );
-        } catch (error) {
-            // User belum pernah start bot atau block bot
-            log('WARN', 'Could not notify user about top up', { targetUserId, error: error.message });
-        }
-
-        log('INFO', 'Admin top up completed', {
-            adminId: chatId,
-            targetUserId,
-            amount,
-            newBalance
-        });
-
-    } catch (error) {
-        log('ERROR', 'Admin top up failed', {
-            error: error.message,
-            adminId: chatId,
-            targetUserId,
-            amount
-        });
-
-        bot.sendMessage(chatId, `❌ Gagal melakukan top up: ${error.message}`);
-    }
-});
-
-// Command /admin_setbalance
-bot.onText(/\/admin_setbalance (\d+) (\d+) ?(.*)/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const targetUserId = parseInt(match[1]);
-    const newAmount = parseInt(match[2]);
-    const reason = match[3] || 'Admin set balance';
-
-    if (!isAdmin(chatId)) {
-        bot.sendMessage(chatId, "❌ Anda tidak memiliki akses admin!");
-        return;
-    }
-
-    if (newAmount < 0) {
-        bot.sendMessage(chatId, "⚠️ Balance tidak boleh negatif");
-        return;
-    }
-
-    try {
-        const oldBalance = getUserBalance(targetUserId);
-        const newBalance = updateUserBalance(targetUserId, newAmount, 'set');
-        
-        saveAdminAction(chatId, {
-            action: 'SET_BALANCE',
-            target_user_id: targetUserId,
-            old_balance: oldBalance,
-            new_balance: newBalance,
-            reason: reason,
-            timestamp: new Date().toISOString()
-        });
-
-        bot.sendMessage(chatId,
-            `✅ *BALANCE DIUBAH*\n\n` +
-            `👤 Target User: ${targetUserId}\n` +
-            `💳 Balance Lama: Rp ${oldBalance.toLocaleString('id-ID')}\n` +
-            `💳 Balance Baru: Rp ${newBalance.toLocaleString('id-ID')}\n` +
-            `📝 Alasan: ${reason}`,
-            {parse_mode: 'Markdown'}
-        );
-
-        // Notifikasi ke user
-        try {
-            bot.sendMessage(targetUserId,
-                `📋 *BALANCE UPDATE*\n\n` +
-                `💳 Balance Anda telah diubah menjadi: Rp ${newBalance.toLocaleString('id-ID')}\n` +
-                `📝 Keterangan: ${reason}`,
-                {parse_mode: 'Markdown'}
-            );
-        } catch (error) {
-            log('WARN', 'Could not notify user about balance change', { targetUserId });
-        }
-
-        log('INFO', 'Admin set balance completed', {
-            adminId: chatId,
-            targetUserId,
-            oldBalance,
-            newBalance
-        });
-
-    } catch (error) {
-        bot.sendMessage(chatId, `❌ Gagal mengubah balance: ${error.message}`);
-    }
-});
-
-// Command /admin_checkbalance
-bot.onText(/\/admin_checkbalance (\d+)/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const targetUserId = parseInt(match[1]);
-
-    if (!isAdmin(chatId)) {
-        bot.sendMessage(chatId, "❌ Anda tidak memiliki akses admin!");
-        return;
-    }
-
-    try {
-        const balance = getUserBalance(targetUserId);
-        const userData = getUserOtpData(targetUserId);
-        
-        bot.sendMessage(chatId,
-            `👤 *USER BALANCE INFO*\n\n` +
-            `🆔 User ID: ${targetUserId}\n` +
-            `💰 Balance: Rp ${balance.toLocaleString('id-ID')}\n` +
-            `📱 Nomor HP: ${userData?.nomor_hp || 'Belum ada'}\n` +
-            `📊 Status: ${userData?.status || 'Belum pernah login'}\n` +
-            `⏰ Last Active: ${userData?.verified_at || 'N/A'}`,
-            {parse_mode: 'Markdown'}
-        );
-
-    } catch (error) {
-        bot.sendMessage(chatId, `❌ Gagal mengecek balance: ${error.message}`);
-    }
-});
-
-// Command /admin_stats
-bot.onText(/\/admin_stats/, async (msg) => {
-    const chatId = msg.chat.id;
-
-    if (!isAdmin(chatId)) {
-        bot.sendMessage(chatId, "❌ Anda tidak memiliki akses admin!");
-        return;
-    }
-
-    try {
-        const otpData = loadOtpData();
-        const userIds = Object.keys(otpData);
-        
-        // Hitung total balance semua user
-        let totalBalance = 0;
-        let activeUsers = 0;
-        let loggedInUsers = 0;
-
-        userIds.forEach(userId => {
-            const balance = getUserBalance(userId);
-            totalBalance += balance;
-            
-            const userData = otpData[userId];
-            if (userData) {
-                if (userData.status === 'logged_in') {
-                    loggedInUsers++;
-                }
-                if (userData.verified_at) {
-                    activeUsers++;
-                }
-            }
-        });
-
-        // Hitung total transaksi
-        let totalTransactions = 0;
-        let totalRevenue = 0;
-        try {
-            const historyData = fs.readFileSync('transaction_history.json', 'utf8');
-            const history = JSON.parse(historyData);
-            
-            Object.values(history).forEach(userHistory => {
-                userHistory.forEach(tx => {
-                    if (tx.status === 'success') {
-                        totalTransactions++;
-                        totalRevenue += tx.amount || 0;
-                    }
-                });
-            });
-        } catch (error) {
-            // File tidak ada
-        }
-
-        bot.sendMessage(chatId,
-            `📊 *STATISTIK BOT*\n\n` +
-            `👥 Total Users: ${userIds.length}\n` +
-            `🟢 Active Users: ${activeUsers}\n` +
-            `🔑 Logged In: ${loggedInUsers}\n\n` +
-            `💰 Total Balance: Rp ${totalBalance.toLocaleString('id-ID')}\n` +
-            `💳 Total Transaksi: ${totalTransactions}\n` +
-            `💵 Total Revenue: Rp ${totalRevenue.toLocaleString('id-ID')}\n\n` +
-            `🕐 Update: ${new Date().toLocaleString('id-ID')}`,
-            {parse_mode: 'Markdown'}
-        );
-
-    } catch (error) {
-        bot.sendMessage(chatId, `❌ Gagal mengambil statistik: ${error.message}`);
-    }
-});
-
-// Command /admin_broadcast
-bot.onText(/\/admin_broadcast (.+)/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const broadcastMessage = match[1];
-
-    if (!isAdmin(chatId)) {
-        bot.sendMessage(chatId, "❌ Anda tidak memiliki akses admin!");
-        return;
-    }
-
-    try {
-        const otpData = loadOtpData();
-        const userIds = Object.keys(otpData);
-        let successCount = 0;
-        let failCount = 0;
-
-        const statusMsg = await bot.sendMessage(chatId, 
-            `📢 Memulai broadcast ke ${userIds.length} users...`
-        );
-
-        for (const userId of userIds) {
-            try {
-                await bot.sendMessage(userId, 
-                    `📢 *PENGUMUMAN*\n\n${broadcastMessage}`, 
-                    {parse_mode: 'Markdown'}
-                );
-                successCount++;
-                
-                // Delay untuk menghindari rate limit
-                await new Promise(resolve => setTimeout(resolve, 100));
-            } catch (error) {
-                failCount++;
-                log('WARN', 'Broadcast failed for user', { userId, error: error.message });
-            }
-        }
-
-        bot.editMessageText(
-            `✅ Broadcast selesai!\n\n` +
-            `📤 Berhasil: ${successCount}\n` +
-            `❌ Gagal: ${failCount}\n` +
-            `📊 Total: ${userIds.length}`,
-            {
-                chat_id: chatId,
-                message_id: statusMsg.message_id
-            }
-        );
-
-        saveAdminAction(chatId, {
-            action: 'BROADCAST',
-            message: broadcastMessage,
-            success_count: successCount,
-            fail_count: failCount,
-            timestamp: new Date().toISOString()
-        });
-
-    } catch (error) {
-        bot.sendMessage(chatId, `❌ Gagal broadcast: ${error.message}`);
-    }
-});
-
-// ===============================
-// CALLBACK QUERY HANDLER
-// ===============================
-
-bot.on('callback_query', async (callbackQuery) => {
-    const chatId = callbackQuery.message.chat.id;
-    const data = callbackQuery.data;
-    const messageId = callbackQuery.message.message_id;
-
-    try {
-        // Handle top up callbacks
-        if (data.startsWith('topup_')) {
-            const amount = data.replace('topup_', '');
-            
-            if (amount === 'custom') {
-                bot.editMessageText(
-                    "💰 *CUSTOM TOP UP*\n\n" +
-                    "Ketik nominal yang ingin Anda top up:\n" +
-                    "Format: /topup_amount <nominal>\n" +
-                    "Contoh: /topup_amount 75000",
-                    {
-                        chat_id: chatId,
-                        message_id: messageId,
-                        parse_mode: 'Markdown'
-                    }
-                );
-            } else {
-                const topupAmount = parseInt(amount);
-                // Simulasi top up berhasil (dalam implementasi nyata, integrasikan dengan payment gateway)
-                const newBalance = updateUserBalance(chatId, topupAmount, 'add');
-                
-                bot.editMessageText(
-                    `✅ *TOP UP BERHASIL!*\n\n` +
-                    `💰 Nominal: Rp ${topupAmount.toLocaleString('id-ID')}\n` +
-                    `💳 Saldo baru: Rp ${newBalance.toLocaleString('id-ID')}\n\n` +
-                    `Terima kasih! Saldo Anda telah ditambahkan.`,
-                    {
-                        chat_id: chatId,
-                        message_id: messageId,
-                        parse_mode: 'Markdown'
-                    }
-                );
-            }
-        }
-        
-        // Handle DOR confirmations
-        else if (data === 'confirm_dor') {
-            await processDorTransaction(chatId, messageId);
-        } else if (data === 'cancel_dor') {
-            bot.editMessageText("❌ Transaksi dibatalkan", {
-                chat_id: chatId,
-                message_id: messageId
-            });
-        }
-        
-        // Handle package list pagination
-        else if (data.startsWith('pkg_page_')) {
-            const page = parseInt(data.replace('pkg_page_', ''));
-            const packages = await fetchPackageList();
-            await showPackageListPage(chatId, messageId, packages, page);
-        }
-        
-        // Handle search pagination
-        else if (data.startsWith('search_page_')) {
-            const parts = data.replace('search_page_', '').split('_');
-            const keyword = parts.slice(0, -1).join('_');
-            const page = parseInt(parts[parts.length - 1]);
-            
-            const packages = await fetchPackageList();
-            const filteredPackages = packages.filter(pkg => 
-                pkg.package_name.toLowerCase().includes(keyword.toLowerCase()) ||
-                pkg.package_code.toLowerCase().includes(keyword.toLowerCase()) ||
-                (pkg.package_description && pkg.package_description.toLowerCase().includes(keyword.toLowerCase()))
-            );
-            
-            await showSearchResults(chatId, messageId, filteredPackages, keyword, page);
-        }
-        
-        // Handle refresh packages
-        else if (data === 'refresh_packages') {
-            const packages = await fetchPackageList(true); // Force refresh
-            await showPackageListPage(chatId, messageId, packages, 1);
-            bot.answerCallbackQuery(callbackQuery.id, {
-                text: "✅ Daftar paket berhasil diperbarui!"
-            });
-        }
-        
-        // Handle search package
-        else if (data === 'search_package') {
-            bot.editMessageText(
-                "🔍 *PENCARIAN PAKET*\n\n" +
-                "Untuk mencari paket, gunakan command:\n" +
-                "`/caripaket <keyword>`\n\n" +
-                "*Contoh pencarian:*\n" +
-                "• `/caripaket unlimited` - Cari paket unlimited\n" +
-                "• `/caripaket combo` - Cari paket combo\n" +
-                "• `/caripaket 2gb` - Cari paket dengan kuota 2GB\n" +
-                "• `/caripaket turbo` - Cari paket turbo\n\n" +
-                "Ketik /listpaket untuk kembali ke daftar lengkap.",
-                {
-                    chat_id: chatId,
-                    message_id: messageId,
-                    parse_mode: 'Markdown'
-                }
-            );
-        }
-        
-        // Handle set package
-        else if (data.startsWith('set_package_')) {
-            const packageCode = data.replace('set_package_', '');
-            
-            // Update package config
-            DOR_CONFIG.packageCode = packageCode;
-            
-            // Simpan ke user data jika perlu
-            const otpData = loadOtpData();
-            if (otpData[chatId]) {
-                otpData[chatId].selected_package = packageCode;
-                saveOtpData(otpData);
-            }
-            
-            bot.editMessageText(
-                `✅ *PAKET BERHASIL DIPILIH*\n\n` +
-                `📦 Paket aktif: \`${packageCode}\`\n\n` +
-                `Sekarang Anda dapat melakukan pembelian dengan paket ini.\n` +
-                `Ketik /dor untuk melanjutkan pembelian.`,
-                {
-                    chat_id: chatId,
-                    message_id: messageId,
-                    parse_mode: 'Markdown'
-                }
-            );
-            
-            log('INFO', 'Package selected from package list', { 
-                chatId, 
-                packageCode 
-            });
-        }
-        
-        // Handle refresh detail
-        else if (data.startsWith('refresh_detail_')) {
-            const packageCode = data.replace('refresh_detail_', '');
-            const packages = await fetchPackageList(true);
-            const pkg = packages.find(p => p.package_code === packageCode);
-            
-            if (pkg) {
-                await showPackageDetail(chatId, messageId, pkg);
-                bot.answerCallbackQuery(callbackQuery.id, {
-                    text: "✅ Detail paket diperbarui!"
-                });
-            } else {
-                bot.answerCallbackQuery(callbackQuery.id, {
-                    text: "❌ Paket tidak ditemukan",
-                    show_alert: true
-                });
-            }
-        }
-        
-        // Handle close packages
-        else if (data === 'close_packages') {
-            bot.editMessageText("📦 Daftar paket ditutup.", {
-                chat_id: chatId,
-                message_id: messageId
-            });
-        }
-
-    } catch (error) {
-        log('ERROR', 'Callback query error', { error: error.message, data });
-        bot.answerCallbackQuery(callbackQuery.id, {
-            text: "❌ Terjadi kesalahan, silakan coba lagi",
-            show_alert: true
-        });
-    }
-
-    bot.answerCallbackQuery(callbackQuery.id);
-});
-
-// ===============================
-// ERROR HANDLING
-// ===============================
-
+// Error handling
 bot.on('polling_error', (error) => {
     log('ERROR', 'Polling error', { error: error.message });
 });
 
-process.on('unhandledRejection', (reason, promise) => {
-    log('ERROR', 'Unhandled Rejection', { reason, promise });
+// Cleanup function untuk data expired
+setInterval(() => {
+    try {
+        const otpData = loadOtpData();
+        const now = Date.now();
+        let hasChanges = false;
+        
+        for (const [chatId, userData] of Object.entries(otpData)) {
+            if (userData.expires_at && now > userData.expires_at) {
+                delete otpData[chatId];
+                hasChanges = true;
+                log('INFO', 'Expired data cleaned up', { chatId });
+            }
+        }
+        
+        if (hasChanges) {
+            saveOtpData(otpData);
+        }
+    } catch (error) {
+        log('ERROR', 'Cleanup process failed', { error: error.message });
+    }
+}, 60000); // Cleanup setiap 1 menit
+
+// Start bot
+log('INFO', 'Telegram bot started successfully');
+console.log('🚀 Bot Telegram XL DOR sedang berjalan...');
+console.log('📱 Bot siap menerima perintah!');
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+    log('INFO', 'Bot shutting down gracefully...');
+    console.log('\n👋 Bot dihentikan. Terima kasih!');
+    process.exit(0);
 });
 
 process.on('uncaughtException', (error) => {
-    log('ERROR', 'Uncaught Exception', { error: error.message });
-    process.exit(1);
+    log('ERROR', 'Uncaught exception', { error: error.message, stack: error.stack });
+    console.error('❌ Uncaught Exception:', error);
 });
 
-// ===============================
-// STARTUP MESSAGE
-// ===============================
+process.on('unhandledRejection', (reason, promise) => {
+    log('ERROR', 'Unhandled rejection', { reason, promise });
+    console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+});
 
-console.log(`
-🤖 XL DOR Bot berhasil dijalankan!
-📅 Waktu: ${new Date().toLocaleString('id-ID')}
-🔧 Mode: ${process.env.NODE_ENV || 'development'}
-
-📋 Fitur yang tersedia:
-• Sistem OTP dan autentikasi XL
-• Balance management
-• Package list dengan API
-• Admin panel
-• Real-time package information
-• Transaction history
-
-✅ Bot siap digunakan!
-`);
+module.exports = bot;
