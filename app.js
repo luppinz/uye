@@ -8,7 +8,7 @@ const path = require('path');
 // ===============================
 
 // Token bot Telegram (ganti dengan token bot Anda)
-const BOT_TOKEN = 'YOUR_BOT_TOKEN_HERE';
+const BOT_TOKEN = '7585136076:AAHCMVn8iYGHDTNRdcnk9tznO-Y_O46BfYo';
 
 // Konfigurasi admin
 const ADMIN_CONFIG = {
