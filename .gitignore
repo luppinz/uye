@@ -1,0 +1,9 @@
+node_modules/
+*.json
+.env
+logs/
+*.log
+otp_data.json
+transaction_history.json
+admin_logs.json
+bot_logs.json
